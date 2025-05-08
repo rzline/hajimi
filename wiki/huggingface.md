@@ -17,9 +17,7 @@
 ### 1.1 配置
 ```Dockerfile
 FROM ghcr.io/你的github用户名/hajimi:latest
-
 EXPOSE 7860
-
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7860"]
 ```
 
