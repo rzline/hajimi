@@ -11,12 +11,22 @@ from app.utils import (
     clean_expired_stats
 )
 import app.config.settings as settings
+import app.vertex.config as app_config
 from app.services import GeminiClient
 from app.utils.auth import verify_web_password
 from app.utils.maintenance import api_call_stats_clean
 from app.utils.logging import log, vertex_log_manager
 from app.config.persistence import save_settings
 from app.utils.stats import api_stats_manager
+from typing import List
+import json
+
+# Import necessary components for Google Credentials JSON update
+from app.vertex.credentials_manager import CredentialManager, parse_multiple_json_credentials
+
+# 引入重新初始化vertex的函数
+from app.vertex.vertex_ai_init import init_vertex_ai as re_init_vertex_ai_function, reset_global_fallback_client
+
 # 创建路由器
 dashboard_router = APIRouter(prefix="/api", tags=["dashboard"])
 
@@ -24,6 +34,7 @@ dashboard_router = APIRouter(prefix="/api", tags=["dashboard"])
 key_manager = None
 response_cache_manager = None
 active_requests_manager = None
+credential_manager = None  # 添加全局credential_manager变量
 
 # 用于存储API密钥检测的进度信息
 api_key_test_progress = {
@@ -38,14 +49,43 @@ api_key_test_progress = {
 def init_dashboard_router(
     key_mgr,
     cache_mgr,
-    active_req_mgr
+    active_req_mgr,
+    cred_mgr=None  # 添加credential_manager参数
 ):
     """初始化仪表盘路由器"""
-    global key_manager, response_cache_manager, active_requests_manager
+    global key_manager, response_cache_manager, active_requests_manager, credential_manager
     key_manager = key_mgr
     response_cache_manager = cache_mgr
     active_requests_manager = active_req_mgr
+    credential_manager = cred_mgr  # 保存credential_manager
     return dashboard_router
+
+async def run_blocking_init_vertex():
+    """Helper to run the init_vertex_ai function with the current credential_manager."""
+    try:
+        if credential_manager is None:
+            # 如果credential_manager为None，记录警告并创建一个新的实例
+            log('warning', "Credential Manager不存在，将创建一个新的实例用于初始化")
+            temp_credential_manager = CredentialManager()
+            credentials_count = temp_credential_manager.get_total_credentials()
+            log('info', f"临时Credential Manager已创建，包含{credentials_count}个凭证")
+            
+            # 传递临时创建的credential_manager实例
+            success = await re_init_vertex_ai_function(credential_manager=temp_credential_manager)
+        else:
+            # 记录当前有多少凭证可用
+            credentials_count = credential_manager.get_total_credentials()
+            log('info', f"使用现有Credential Manager进行初始化，当前有{credentials_count}个凭证")
+            
+            # 传递当前的credential_manager实例
+            success = await re_init_vertex_ai_function(credential_manager=credential_manager)
+        
+        if success:
+            log('info', "异步重新执行 init_vertex_ai 成功，以响应 Google Credentials JSON 的更新。")
+        else:
+            log('warning', "异步重新执行 init_vertex_ai 失败或未完成，在 Google Credentials JSON 更新后。")
+    except Exception as e:
+        log('error', f"执行 run_blocking_init_vertex 时出错: {e}")
 
 @dashboard_router.get("/dashboard-data")
 async def get_dashboard_data():
@@ -82,12 +122,18 @@ async def get_dashboard_data():
     active_count = len(active_requests_manager.active_requests)
     active_done = sum(1 for task in active_requests_manager.active_requests.values() if task.done())
     active_pending = active_count - active_done
+
+    # 获取凭证数量
+    credentials_count = 0
+    if credential_manager is not None:
+        credentials_count = credential_manager.get_total_credentials()
     
     # 返回JSON格式的数据
     return {
         "key_count": len(key_manager.api_keys),
         "model_count": len(GeminiClient.AVAILABLE_MODELS),
         "retry_count": settings.MAX_RETRY_NUM,
+        "credentials_count": credentials_count,  # 添加凭证数量
         "last_24h_calls": last_24h_calls,
         "hourly_calls": hourly_calls,
         "minute_calls": minute_calls,
@@ -129,8 +175,11 @@ async def get_dashboard_data():
         # 添加Vertex Express配置
         "enable_vertex_express": settings.ENABLE_VERTEX_EXPRESS,
         "vertex_express_api_key": bool(settings.VERTEX_EXPRESS_API_KEY),  # 只返回是否设置的状态
+        "google_credentials_json": bool(settings.GOOGLE_CREDENTIALS_JSON),  # 只返回是否设置的状态
         # 添加最大重试次数
         "max_retry_num": settings.MAX_RETRY_NUM,
+        # 添加空响应重试次数限制
+        "max_empty_responses": settings.MAX_EMPTY_RESPONSES,
     }
 
 @dashboard_router.post("/reset-stats")
@@ -226,6 +275,15 @@ async def update_config(config_data: dict):
             settings.FAKE_STREAMING = config_value
             log('info', f"假流式请求已更新为：{config_value}")
             
+            # 同步更新vertex配置中的假流式设置
+            try:
+                import app.vertex.config as vertex_config
+                vertex_config.FAKE_STREAMING_ENABLED = config_value  # 直接更新全局变量
+                vertex_config.update_config('FAKE_STREAMING', config_value)  # 同时调用更新函数
+                log('info', f"已同步更新Vertex中的假流式设置为：{config_value}")
+            except Exception as e:
+                log('warning', f"更新Vertex假流式设置时出错: {str(e)}")
+            
         elif config_key == "enable_vertex_express":
             if not isinstance(config_value, bool):
                 raise HTTPException(status_code=422, detail="参数类型错误：应为布尔值")
@@ -235,8 +293,26 @@ async def update_config(config_data: dict):
         elif config_key == "vertex_express_api_key":
             if not isinstance(config_value, str):
                 raise HTTPException(status_code=422, detail="参数类型错误：应为字符串")
-            settings.VERTEX_EXPRESS_API_KEY = config_value
-            log('info', f"Vertex Express API Key已更新")
+            
+            # 检查是否为空字符串或"true"，如果是，则不更新
+            if not config_value or config_value.lower() == "true":
+                log('info', f"Vertex Express API Key未更新，因为值为空或为'true'")
+            else:
+                settings.VERTEX_EXPRESS_API_KEY = config_value
+                # 更新app_config中的API密钥列表
+                app_config.VERTEX_EXPRESS_API_KEY_VAL = [key.strip() for key in config_value.split(',') if key.strip()]
+                log('info', f"Vertex Express API Key已更新，共{len(app_config.VERTEX_EXPRESS_API_KEY_VAL)}个有效密钥")
+                
+                # 尝试刷新模型配置
+                try:
+                    from app.vertex.model_loader import refresh_models_config_cache
+                    refresh_success = await refresh_models_config_cache()
+                    if refresh_success:
+                        log('info', "更新Express API Key后成功刷新模型配置")
+                    else:
+                        log('warning', "更新Express API Key后刷新模型配置失败，将使用默认模型或现有缓存")
+                except Exception as e:
+                    log('warning', f"尝试刷新模型配置时出错: {str(e)}")
             
         elif config_key == "fake_streaming_interval":
             try:
@@ -245,6 +321,14 @@ async def update_config(config_data: dict):
                     raise ValueError("假流式间隔必须大于0")
                 settings.FAKE_STREAMING_INTERVAL = value
                 log('info', f"假流式间隔已更新为：{value}")
+                
+                # 同步更新vertex配置中的假流式间隔设置
+                try:
+                    import app.vertex.config as vertex_config
+                    vertex_config.update_config('FAKE_STREAMING_INTERVAL', value)
+                    log('info', f"已同步更新Vertex中的假流式间隔设置为：{value}")
+                except Exception as e:
+                    log('warning', f"更新Vertex假流式间隔设置时出错: {str(e)}")
             except ValueError as e:
                 raise HTTPException(status_code=422, detail=f"参数类型错误：{str(e)}")
                 
@@ -322,6 +406,108 @@ async def update_config(config_data: dict):
                 raise HTTPException(status_code=422, detail="参数类型错误：应为布尔值")
             settings.ENABLE_VERTEX = config_value
             log('info', f"Vertex AI 已更新为：{config_value}")
+
+        elif config_key == "google_credentials_json":
+            if not isinstance(config_value, str): # Allow empty string to clear
+                raise HTTPException(status_code=422, detail="参数类型错误：Google Credentials JSON 应为字符串")
+
+            # 检查是否为空字符串或"true"，如果是，则不更新
+            if not config_value or config_value.lower() == "true":
+                log('info', f"Google Credentials JSON未更新，因为值为空或为'true'")
+                save_settings() # 仍然保存其他可能的设置更改
+                return {"status": "success", "message": f"配置项 {config_key} 未更新，值为空或为'true'"}
+
+            # Validate JSON structure if not empty
+            if config_value:
+                try:
+                    # Attempt to parse as single or multiple JSONs
+                    # parse_multiple_json_credentials logs errors if parsing fails but returns list.
+                    temp_parsed = parse_multiple_json_credentials(config_value)
+                    # If parse_multiple_json_credentials returns an empty list for a non-empty string,
+                    # it means it didn't find any valid top-level JSON objects as per its logic.
+                    # We can do an additional check for a single valid JSON object.
+                    if not temp_parsed: # and config_value.strip(): # ensure non-empty string before json.loads
+                        try:
+                            # This is a stricter check. If parse_multiple_json_credentials, which is more lenient,
+                            # failed to find anything, and this also fails, then it's likely malformed.
+                            json.loads(config_value) # Try parsing as a single JSON object
+                            # If this succeeds, it implies the string IS a valid single JSON,
+                            # but not in the multi-JSON format parse_multiple_json_credentials might be looking for initially.
+                            # parse_multiple_json_credentials will be called again later and should handle it.
+                        except json.JSONDecodeError:
+                            # This specific error means it's not even a valid single JSON.
+                            raise HTTPException(status_code=422, detail="Google Credentials JSON 格式无效。它既不是有效的单个JSON对象，也不是逗号分隔的多个JSON对象。")
+                except HTTPException: # Re-raise if it's already an HTTPException from inner check
+                    raise
+                except Exception as e: # Catch any other error during this pre-check
+                    # This might catch errors if parse_multiple_json_credentials itself had an unexpected issue
+                    # not related to JSONDecodeError but still an error.
+                    raise HTTPException(status_code=422, detail=f"Google Credentials JSON 预检查失败: {str(e)}")
+
+            settings.GOOGLE_CREDENTIALS_JSON = config_value
+            log('info', "Google Credentials JSON 设置已更新 (内容未记录)。")
+
+            # Reset global fallback client first
+            reset_global_fallback_client()
+
+            # Clear previously loaded JSON string credentials from manager
+            if credential_manager is not None:
+                cleared_count = credential_manager.clear_json_string_credentials()
+                log('info', f"从 CredentialManager 中清除了 {cleared_count} 个先前由 JSON 字符串加载的凭据。")
+
+                if config_value: # If new JSON string is provided
+                    parsed_json_objects = parse_multiple_json_credentials(config_value)
+                    if parsed_json_objects:
+                        loaded_count = credential_manager.load_credentials_from_json_list(parsed_json_objects)
+                        if loaded_count > 0:
+                            log('info', f"从更新的 Google Credentials JSON 中加载了 {loaded_count} 个凭据到 CredentialManager。")
+                        else:
+                            log('warning', "尝试加载Google Credentials JSON凭据失败，没有凭据被成功加载。")
+                    else:
+                        # 尝试作为单个JSON对象加载
+                        try:
+                            single_cred = json.loads(config_value)
+                            if credential_manager.add_credential_from_json(single_cred):
+                                log('info', "作为单个JSON对象成功加载了一个凭据。")
+                            else:
+                                log('warning', "作为单个JSON对象加载凭据失败。")
+                        except json.JSONDecodeError:
+                            log('warning', "Google Credentials JSON无法作为JSON对象解析。")
+                        except Exception as e:
+                            log('warning', f"尝试加载单个JSON凭据时出错: {str(e)}")
+                else:
+                    log('info', "Google Credentials JSON 已被清空。CredentialManager 中来自 JSON 字符串的凭据已被移除。")
+                
+                # 检查凭证是否存在
+                if credential_manager.get_total_credentials() == 0:
+                    log('warning', "警告：当前没有可用的凭证。Vertex AI功能可能无法正常工作。")
+            else:
+                log('warning', "CredentialManager未初始化，无法加载Google Credentials JSON。")
+            
+            # Save all settings changes
+            save_settings() # Moved save_settings here to ensure it's called for this key
+
+            # Trigger re-initialization of Vertex AI (which can re-init the global client)
+            try:
+                # 检查credential_manager是否可用
+                if credential_manager is None:
+                    log('warning', "重新初始化Vertex AI时发现credential_manager为None")
+                else:
+                    log('info', f"开始重新初始化Vertex AI，当前凭证数: {credential_manager.get_total_credentials()}")
+                
+                # 调用run_blocking_init_vertex
+                await run_blocking_init_vertex()
+                log('info', "Vertex AI服务重新初始化完成")
+                
+                # 显式刷新模型配置缓存
+                from app.vertex.model_loader import refresh_models_config_cache
+                refresh_success = await refresh_models_config_cache()
+                if refresh_success:
+                    log('info', "成功刷新模型配置缓存")
+                else:
+                    log('warning', "刷新模型配置缓存失败，将使用默认模型或现有缓存")
+            except Exception as e:
+                log('error', f"重新初始化Vertex AI服务时出错: {str(e)}")
         
         elif config_key == "max_retry_num":
             try:
@@ -382,6 +568,16 @@ async def update_config(config_data: dict):
             
             log('info', f"已添加 {added_key_count} 个新API密钥，当前共有 {len(key_manager.api_keys)} 个")
                 
+        elif config_key == "max_empty_responses":
+            try:
+                value = int(config_value)
+                if value < 0: # 通常至少为0或1，根据实际需求调整
+                    raise ValueError("空响应重试次数不能为负数")
+                settings.MAX_EMPTY_RESPONSES = value
+                log('info', f"空响应重试次数已更新为：{value}")
+            except ValueError as e:
+                raise HTTPException(status_code=422, detail=f"参数类型错误：{str(e)}")
+        
         else:
             raise HTTPException(status_code=400, detail=f"不支持的配置项：{config_key}")
         save_settings()

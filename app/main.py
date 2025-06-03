@@ -2,7 +2,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from app.models import ErrorResponse
+from fastapi.middleware.cors import CORSMiddleware
+from app.models.schemas import ErrorResponse
 from app.services import GeminiClient
 from app.utils import (
     APIKeyManager, 
@@ -16,7 +17,8 @@ from app.utils import (
 )
 from app.config.persistence import save_settings, load_settings
 from app.api import router, init_router, dashboard_router, init_dashboard_router
-from app.vertex.vertex import init_vertex_ai
+from app.vertex.vertex_ai_init import init_vertex_ai
+from app.vertex.credentials_manager import CredentialManager
 import app.config.settings as settings
 from app.config.safety import SAFETY_SETTINGS, SAFETY_SETTINGS_G2
 import asyncio
@@ -28,6 +30,17 @@ BASE_DIR = pathlib.Path(__file__).parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 app = FastAPI(limit="50M")
+
+# --------------- CORS 中间件 ---------------
+# 如果 ALLOWED_ORIGINS 为空列表，则不允许任何跨域请求
+if settings.ALLOWED_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.ALLOWED_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # --------------- 全局实例 ---------------
 load_settings()
@@ -53,6 +66,20 @@ active_requests_manager = ActiveRequestsManager(requests_pool=active_requests_po
 SKIP_CHECK_API_KEY = os.environ.get("SKIP_CHECK_API_KEY", "").lower() == "true"
 
 # --------------- 工具函数 ---------------
+# @app.middleware("http")
+# async def log_requests(request: Request, call_next):
+#     """
+#     DEBUG用，接收并打印请求内容
+#     """
+#     log('info', f"接收到请求: {request.method} {request.url}")
+#     try:
+#         body = await request.json()
+#         log('info', f"请求体: {body}")
+#     except Exception:
+#         log('info', "请求体不是 JSON 格式或者为空")
+    
+#     response = await call_next(request)
+#     return response
 
 async def check_remaining_keys_async(keys_to_check: list, initial_invalid_keys: list):
     """
@@ -61,20 +88,17 @@ async def check_remaining_keys_async(keys_to_check: list, initial_invalid_keys: 
     local_invalid_keys = []
     found_valid_keys =False
 
+    log('info', f" 开始在后台检查剩余 API Key 是否有效")
     for key in keys_to_check:
-        try:
-            is_valid = await test_api_key(key)
-            if is_valid:
-                if key not in key_manager.api_keys: # 避免重复添加
-                    key_manager.api_keys.append(key)
-                    found_valid_keys = True
-                log('info', f"API Key {key[:8]}... 有效")
-            else:
-                local_invalid_keys.append(key)
-                log('warning', f" API Key {key[:8]}... 无效")
-        except Exception as e:
-            log('warning', f"检查 API Key {key[:8]}... 时出错",extra={'error_message': str(e)})
-            local_invalid_keys.append(key) # 出错也视为无效
+        is_valid = await test_api_key(key)
+        if is_valid:
+            if key not in key_manager.api_keys: # 避免重复添加
+                key_manager.api_keys.append(key)
+                found_valid_keys = True
+            # log('info', f"API Key {key[:8]}... 有效")
+        else:
+            local_invalid_keys.append(key)
+            log('warning', f" API Key {key[:8]}... 无效")
         
         await asyncio.sleep(0.05) # 短暂休眠，避免请求过于密集
 
@@ -105,14 +129,26 @@ sys.excepthook = handle_exception
 
 @app.on_event("startup")
 async def startup_event():
-    log('info', "Starting Gemini API proxy...")
-    await check_version()
-    init_vertex_ai()
-    log('info', "初始化Vertex AI")
+    
+    # 首先加载持久化设置，确保所有配置都是最新的
+    load_settings()
+    
+    
+    # 重新加载vertex配置，确保获取到最新的持久化设置
+    import app.vertex.config as vertex_config
+    vertex_config.reload_config()
+    
+    
+    # 初始化CredentialManager
+    credential_manager_instance = CredentialManager()
+    # 添加到应用程序状态
+    app.state.credential_manager = credential_manager_instance
+    
+    # 初始化Vertex AI服务
+    await init_vertex_ai(credential_manager=credential_manager_instance)
     schedule_cache_cleanup(response_cache_manager, active_requests_manager)
     # 检查版本
     await check_version()
-    load_settings()
     
     # 密钥检查 
     initial_keys = key_manager.api_keys.copy()
@@ -186,7 +222,8 @@ async def startup_event():
     init_dashboard_router(
         key_manager,
         response_cache_manager,
-        active_requests_manager
+        active_requests_manager,
+        credential_manager_instance
     )
 
 # --------------- 异常处理 ---------------
